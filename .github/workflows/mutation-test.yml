@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     # Whole-folder mutation against ~15 files / ~7.5k LOC can take hours.
     # 350 minutes is just under the GitHub-hosted job cap of 360 minutes.
-    timeout-minutes: 350
+    timeout-minutes: 300
 
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -87,46 +87,71 @@ jobs:
         run: |
           uv pip uninstall pytest-retry || true
 
-      # Ends before the job's own deadline so a run that outlasts the budget is
-      # still followed by the report and upload steps. mutmut saves after every
-      # mutant result, to mutants/<source path>.meta, so an interrupted run
-      # still scores the mutants it finished and export-cicd-stats can read
-      # them; a cancelled job skips those steps and publishes nothing at all.
-      - name: Run mutmut
-        timeout-minutes: 300
+      # DIAGNOSTIC BRANCH, NOT FOR MERGE. Narrow the mutation scope to one
+      # small file so the sandbox is built in minutes instead of an hour, then
+      # run the whole mapped test folder inside that sandbox with no -x, to get
+      # the complete list of tests that cannot run there. The real run uses -x
+      # during stats collection, so it only ever names the first offender.
+      - name: Narrow the mutation scope
+        run: |
+          python - <<'EOF'
+          p = "pyproject.toml"
+          s = open(p).read()
+          s = s.replace('    "litellm/proxy/management_endpoints/",\n',
+                        '    "litellm/proxy/management_endpoints/ui_sso.py",\n')
+          open(p, "w").write(s)
+          EOF
+          sed -n '/paths_to_mutate/,/]/p' pyproject.toml
+
+      - name: Build the mutants sandbox
+        timeout-minutes: 60
         env:
-          # Make the mutants/ sandbox win over site-packages on sys.path so the
-          # trampolined files are imported instead of the installed copy.
           PYTHONPATH: ${{ github.workspace }}/mutants
-          # Without this mutmut finds no covered lines and generates 0 mutants.
-          # See the file itself for why.
           COVERAGE_RCFILE: ${{ github.workspace }}/.github/mutmut-coverage.rc
         run: |
-          set -o pipefail
           mkdir -p mutants
+          set +e
           uv run --no-sync --with mutmut==3.5.0 mutmut run 2>&1 | tee mutmut-run.log
+          echo "mutmut exited ${PIPESTATUS[0]}"
+          ls -d mutants/tests mutants/litellm 2>&1
 
-      # Generate the structured report. The script embeds the enclosing
-      # function source for each survivor (via Python AST) and includes the
-      # existing test files, so an LLM agent has enough context to write
-      # killing tests without further file lookups. Modeled on Meta's ACH
-      # prompt template (arXiv 2501.12862).
-      - name: Generate detailed mutation report
+      - name: Census every test that fails inside the sandbox
+        timeout-minutes: 90
+        env:
+          PYTHONPATH: ${{ github.workspace }}/mutants
+        run: |
+          cd mutants
+          set +e
+          uv run --no-sync python -m pytest \
+            tests/test_litellm/proxy/management_endpoints/ \
+            -p no:retry -p no:rerunfailures -p no:xdist \
+            -q -rf --continue-on-collection-errors \
+            > ../sandbox-census.log 2>&1
+          echo "pytest exited $?"
+          cd ..
+          echo "===== tail ====="
+          tail -40 sandbox-census.log
+          echo "===== FAILED / ERROR lines ====="
+          grep -E "^(FAILED|ERROR)" sandbox-census.log | tee sandbox-failures.txt
+          echo "===== count ====="
+          wc -l < sandbox-failures.txt
+
+      # Same folder, same flags, WITHOUT the sandbox, as the control. If a test
+      # fails here too it is a plain test bug, not a sandbox artifact.
+      - name: Control run outside the sandbox
         if: always()
+        timeout-minutes: 90
         run: |
           set +e
-          uv run --no-sync --with mutmut==3.5.0 mutmut export-cicd-stats > /dev/null 2>&1
-          uv run --no-sync --with mutmut==3.5.0 mutmut results > mutmut-results.txt 2>&1
-          uv run --no-sync python scripts/mutation_report.py
-          # The full report can be very long for big test files; the run-page
-          # summary cuts off at 1 MB. Append the head of the report (summary
-          # + survivor list) and link out to the artifact for the full body.
-          {
-            head -c 900000 mutation-report.md
-            echo ""
-            echo ""
-            echo "_Full report (with embedded function bodies and test files) is in the workflow artifact._"
-          } >> "$GITHUB_STEP_SUMMARY"
+          uv run --no-sync python -m pytest \
+            tests/test_litellm/proxy/management_endpoints/ \
+            -p no:retry -p no:rerunfailures -p no:xdist \
+            -q -rf --continue-on-collection-errors \
+            > control-census.log 2>&1
+          echo "pytest exited $?"
+          tail -20 control-census.log
+          grep -E "^(FAILED|ERROR)" control-census.log | tee control-failures.txt
+          wc -l < control-failures.txt
 
       - name: Upload mutmut artifacts
         if: always()
@@ -137,6 +162,10 @@ jobs:
             mutation-report.md
             mutmut-results.txt
             mutmut-run.log
+            sandbox-census.log
+            sandbox-failures.txt
+            control-census.log
+            control-failures.txt
             mutants/mutmut-stats.json
             mutants/mutmut-cicd-stats.json
             mutants/**/*.meta
